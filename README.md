@@ -9,6 +9,7 @@ The data that support the findings of this study are restricted and available fr
 The package includes a folder structure and two do-files, that should be run in the following order:
 
 1 - analysis.do: Runs the regression models described in the paper
+
 2 - outputs.do:  Generates the tables and figures used in the paper
 
 ******************************************************
