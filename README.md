@@ -3,7 +3,7 @@
 
 README
 
-**Replication Data for the paper titled "Free-for-all: Does crowding impact outcomes because hospital emergency departments do not prioritise effectively?"**
+**Replication package for the paper titled "Free-for-all: Does crowding impact outcomes because hospital emergency departments do not prioritise effectively?"**
 
 Author: Igor Francetic
 
@@ -15,7 +15,7 @@ This version: 28/02/2024 (R&R version)
 
 NOTE ON DATA AVAILABILITY:
 
-The data that support the findings of this study are restricted and available from NHS Digital. This repository includes the Stata code used for the analyses and a comprehensive data dictionary.
+The data that support the findings of this study are restricted and available from NHS Digital. This repository includes the Stata code used for the analyses and a comprehensive data dictionary. Note: do-files that clean raw NHS data and prepare datasets ready for analsysis can be provided upon request.
 
 The package includes a folder structure and two do-files, that should be run in the following order:
 
