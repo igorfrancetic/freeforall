@@ -1,6 +1,6 @@
 ////////////////////////////////////////////////////////////////////////////////
 // Do-file running the analyses for the paper
-// Version: 08/08/2023
+// Version: 28/02/2024
 ///////////////////////////////////////////////////////////////////////////////
 
 capture log close
@@ -8,6 +8,7 @@ clear all
 set more off, perm
 set matsize 11000
 set maxvar 100000
+set processors 12
 
 /* Set paths */
 if c(username)=="Add your username" {
@@ -15,8 +16,8 @@ if c(username)=="Add your username" {
 }
 
 cd "$path"
-*do preliminary // Uncomment to run preliminary.do saved in the same folder
-*use finaldata, clear // The data that support the findings of this study are restricted and only available upon request from NHS Digital
+*do preliminary // Uncomment to run preliminary.do saved in the same folder, which prepares the dataset from raw NHS data files
+use finaldata, clear // The data that support the findings of this study are restricted and only available upon request from NHS Digital
 
 ////////////////////////////////////////////////////////////////////////////////
 *********************************** ANALYSIS ***********************************
@@ -38,19 +39,22 @@ global x1 i.agesex ib0.eth i.imd2015_cat ib41.prim_diag ib0.nattsyr ib0.nemadyr 
 global x2 i.agesex ib0.eth i.imd2015_cat ib41.prim_diag ib0.nattsyr ib0.nemadyr ib2.arrmode i.attcat ib80.patgrp ib1.refsource ib10.incloc ib1.bedocc_yday_q
 
 // Outcomes 
+global bin_out tot4hr admit lwt disch_nof disch_gp refclin refoth 
+global after_out reatt7_all dead30_ons 
 global cont_out aecost ninv1 ntrt1 totdur initdur durinvtret
-global bin_out tot4hr admit lwt disch_nof disch_gp refclin refoth
-global bin_outalt tot4hr // Global exlcuding discharge destinations from binary outcomes for stratified analyses conditioning on discharge
-global after_out reatt7_all reatt30_all dead7_ons dead30_ons 
+egen day=group(attdate)
+
+compress
 
 ////////////////////////////////////////////////////////////////////////////////
-//  MAIN ESTIMATES
+// MAIN ESTIMATES (Table 3)
+// Estimating Linear models with HDFEs and transforming both attendances
+// to the SD scale dividing by SD of unexpected volumes
 ////////////////////////////////////////////////////////////////////////////////
-// Estimating Linear/Poisson models with HDFEs scaling attendance volumes by  SD
 
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -58,10 +62,32 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/main/`y'_allhdfe", replace
+eststo `y'_main
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/main/`y'_main", replace
 }
-** Poisson HDFE model for continous outcomes
+
+// Test differences between avoidable and non-avoidable on volume scale (not SD scale)
+eststo clear
+foreach y in $bin_out $after_out $cont_out {
+qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
+qui: sum unexp_avoid_na if e(sample)
+scalar sd1=`r(sd)' 
+qui: sum unexp_nonavoid_na if e(sample)
+scalar sd2=`r(sd)'
+display `"`y'"', `"`:var label `y''"', `"`:val label `y''"'
+estimates use "Output/Main/`y'_main.ster"
+eststo `y': test sd1*est_dailyvol_avoid=sd2*est_dailyvol_nonavoid
+estadd scalar wald=`r(p)'
+}
+esttab $bin_out $after_out $cont_out using "output/main/wald.rtf", keep(*cons*) scalar(wald) p(%9.4f) label replace
+
+////////////////////////////////////////////////////////////////////////////////
+// Main models estimating discrete outcomes with Poisson models (Table A.5)
+////////////////////////////////////////////////////////////////////////////////
+
+** Poisson HDFE model 
 eststo clear
 foreach y in $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
@@ -73,120 +99,156 @@ ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable=
 eststo `y'_poisson_nonavoid
 margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-estimates save "output/main/`y'_poisson_allhdfe", replace
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_poisson_main", replace
 }
-     
+
+////////////////////////////////////////////////////////////////////////////////
+// Sharpened Q for Multiple Hypothesis Testing (multiple outcomes, Table A.4)
+** Source: Anderson (2008), "Multiple Inference and Gender Differences in the Effects of Early Intervention: 
+** A Reevaluation of the Abecedarian, Perry Preschool, and Early Training Projects", JASA, 103(484), 1481-1495
+** Code available from: https://are.berkeley.edu/~mlanderson/ARE_Website/Research.html
+////////////////////////////////////////////////////////////////////////////////
+preserve
+clear all
+eststo clear
+matrix vec=[.]
+foreach y in $bin_out $after_out $cont_out {
+estimates use "output/main/`y'_main.ster"
+ereturn display
+matrix R=r(table)
+matrix vec=[vec \ R[4,1]]
+matrix vec=[vec \ R[4,2]]
+}
+svmat vec
+rename vec1 pval
+drop if missing(pval)
+do fdr_sharpened_qvalues // Call Anderson (2008) code, modified to run here
+export delimited using "output/main/mht.csv", replace
+restore
+  
 ////////////////////////////////////////////////////////////////////////////////
 // Heterogeneity 1: Use deciles of unexpected volumes instead of main exposure
 // Goal: is there a threshold beyond which detrimental effects are observed?
 ////////////////////////////////////////////////////////////////////////////////
 
-** Linear HDFE model for binary outcomes 
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 xtile dailyvol_avoid_q = unexp_avoid_na if e(sample), nq(10)
 xtile dailyvol_nonavoid_q = unexp_nonavoid_na if e(sample), nq(10)
 reghdfe `y' ib5.dailyvol_avoid_q ib5.dailyvol_nonavoid_q ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop dailyvol_avoid_q dailyvol_nonavoid_q
-eststo `y'_decil_nonavoid
-estimates save "output/main/`y'_allhdfe_dec", replace
+eststo `y'_decil
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/main/`y'_dec", replace
 }
 
-** Poisson HDFE model for continous outcomes
+// Test differences between avoidable and non-avoidable on volume scale (not SD scale)
 eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-xtile dailyvol_avoid_q = unexp_avoid_na if e(sample), nq(10)
-xtile dailyvol_nonavoid_q = unexp_nonavoid_na if e(sample), nq(10)
-ppmlhdfe `y' ib5.dailyvol_avoid_q ib5.dailyvol_nonavoid_q  ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins rb5.dailyvol_avoid_q rb5.dailyvol_nonavoid_q, post
-drop dailyvol_avoid_q dailyvol_nonavoid_q 
-estimates save "output/main/`y'_poisson_dec", replace
+foreach y in $bin_out $after_out $cont_out {
+display `"`y'"', `"`:var label `y''"', `"`:val label `y''"'
+estimates use "output/main/`y'_dec.ster"
+forvalues i=1/10 {
+eststo `y'_`i': test `i'.dailyvol_avoid_q=`i'.dailyvol_nonavoid_q
+estadd scalar wald_`i'=`r(p)'
 }
+}
+esttab totdur_10 initdur_10 durinvtret_10 tot4hr_10 aecost_10 ninv1_10 ntrt1_10 admit_10 lwt_10 disch_nof_10 disch_gp_10 refclin_10 refoth_10 reatt7_all_10 dead30_ons_10 using "output/main/decwald.rtf", keep(*cons*) scalar(wald_1 wald_2 wald_3 wald_4 wald_6 wald_7 wald_8 wald_9 wald_10) p(%9.4f) label replace
 
-////////////////////////////////////////////////////////////////////////////////
-// Heterogeneity 2: Estimates model across tertiles of NAV/AV ratio
-// Goal: Are the results consistent with the model in relation to higher NA %?
-////////////////////////////////////////////////////////////////////////////////
-gen rationavav=dailyvol_nonavoid/dailyvol_total
-xtile tert_ratio=rationavav, nq(3)
 
-forvalues i=1/3 {
-preserve
-keep if tert_ratio==`i'
-// Estimating Linear/Poisson models with HDFEs and transforming both attendances
-// to the SD scale dividing by SD of unexpected volumes
-** Linear HDFE model for binary outcomes
-eststo clear
-foreach y in $bin_out $after_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
-drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/main/`y'_ratio`i'", replace
-}
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
-estimates save "output/main/`y'_ratio`i'", replace
-}
-
-restore
-}
-  
 ////////////////////////////////////////////////////////////////////////////////
 // ROBUSTNESS CHECKS
 ////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////
-// Supply side 1: Reverse causality in defining avoidable/non-avoidable patients
+// Exogeneity of exposure 1: Model without covariates
 ////////////////////////////////////////////////////////////////////////////////
 
+** Linear HDFE model
+eststo clear
+foreach y in $bin_out $after_out $cont_out {
+qui: areg `y' dailyvol_avoid dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe)
+qui: sum unexp_avoid_na if e(sample)
+gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
+qui: sum unexp_nonavoid_na if e(sample)
+gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
+reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
+drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_nocontrols
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/main/`y'_nocontrols", replace
+}
+
 ////////////////////////////////////////////////////////////////////////////////
-// Determinants of NHS avoidable state across distribution of unexpected volumes
+// Exogeneity of exposure 2: Patient characteristics on LHS
 ////////////////////////////////////////////////////////////////////////////////
+
+gen nonwhite=0 if eth==0
+replace nonwhite=1 if eth>0&eth<5
+gen over65=.
+replace over65=0 if arrivalage>0&arrivalage<66
+replace over65=1 if arrivalage>64&arrivalage!=.
+gen anyatt=.
+replace anyatt=0 if nattsyr==0
+replace anyatt=1 if nattsyr>0&nattsyr!=.
+gen  anyemad=.
+replace anyemad=0 if nemadyr==0
+replace anyemad=1 if nemadyr>0&nemadyr!=.
+global exolinear nattsyr nemadyr over65 
+
+** Linear HDFE model
 eststo clear
-bysort unexp_avoid_na_q: eststo: quietly estpost summarize nhs_avoidable nhstreat nhsinvest nhsdisch nhsarrmode reatt7_all reatt30_all reatt7_unplan reatt30_unplan
-esttab using "output/robustness/qvolume_avoid.rtf", cells("mean(fmt(3)) sd(fmt(3))") title("Quintile unexp avoidable") replace
-eststo clear
-bysort unexp_avoid_na_q: eststo: quietly estpost summarize nhs_avoidable nhstreat nhsinvest nhsdisch nhsarrmode reatt7_all reatt30_all reatt7_unplan reatt30_unplan
-esttab using "output/robustness/qvolume_total.rtf", cells("mean sd") title("Quintile unexp total") replace
-eststo clear
-bysort unexp_avoid_na_q: eststo: quietly estpost summarize $count $bin $after
-esttab using "output/robustness/qvolume_outcomes.rtf", cells("mean sd") title("Outcomes across quintiles of avoidable att (full sample)") replace  
-   
+foreach y in $exolinear {
+qui: areg `y' dailyvol_avoid dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe)
+qui: sum unexp_avoid_na if e(sample)
+gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
+qui: sum unexp_nonavoid_na if e(sample)
+gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
+reghdfe `y' est_dailyvol_avoid if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
+eststo `y'_exoav
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_exoav", replace
+reghdfe `y' est_dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
+eststo `y'_exonav
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_exonav", replace
+reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
+eststo `y'_exoboth
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_exoboth", replace
+drop est_dailyvol_avoid est_dailyvol_nonavoid
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Supply side 1: Alternative "avoidable attendance" definitions
+////////////////////////////////////////////////////////////////////////////////
+
 ////////////////////////////////////////////////////////////////////////////////
 // Tammes definition instead of NHS 
 // Transforming attendance volume to the SD scale
 ////////////////////////////////////////////////////////////////////////////////
 
-bysort prov_id arrivaldate: egen dailyvol_tamav=total(tammes_avoidable)
-bysort prov_id arrivaldate: egen dailyvol_tamnon=total(tammes_nonavoidable)
+bysort prov_id attdate: egen dailyvol_tamav=total(tammes_avoidable)
+bysort prov_id attdate: egen dailyvol_tamnon=total(tammes_nonavoidable)
 areg dailyvol_tamav if tammes_avoidable==0, absorb(prov_dow_fe)
 predict exp_tamav, xbd
 predict unexp_tamav, residual
 areg dailyvol_tamnon if tammes_avoidable==0, absorb(prov_dow_fe)
 predict exp_tamnon, xbd
 predict unexp_tamnon, residual
+corr unexp_tamav unexp_tamnon
 
-** Linear HDFE model for binary outcomes
+// Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_tamav dailyvol_tamnon ${x1} if tammes_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_tamav if e(sample)
 gen est_dailyvol_avoid=dailyvol_tamav/`r(sd)' if e(sample)
@@ -195,41 +257,29 @@ gen est_dailyvol_nonavoid=dailyvol_tamnon/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if tammes_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
 eststo `y'_tammes
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_tammes", replace
 }
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_tamav dailyvol_tamnon ${x1} if tammes_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_tamav if e(sample)
-gen est_dailyvol_avoid=dailyvol_tamav/`r(sd)' if e(sample)
-qui: sum unexp_tamnon if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_tamnon/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if tammes_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_tammes
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
-estimates save "output/robustness/`y'_poisson_tammes", replace
-}
-       
+    
 //////////////////////////////////////////////////////////////////////////////// 
 // Ambulance arrival as definition of non-avoidable instead of NHS
 // Transforming attendance volume to the SD scale
 ////////////////////////////////////////////////////////////////////////////////
 
-bysort prov_id arrivaldate: egen dailyvol_nonavoidamb=total(ambarrival)
+bysort prov_id attdate: egen dailyvol_nonavoidamb=total(ambarrival)
 gen dailyvol_avoidamb=dailyvol_total-dailyvol_nonavoidamb
 areg dailyvol_avoidamb if ambarrival==1, absorb(prov_dow_fe)
 predict exp_avoidamb, xbd
-predict unexp_nonavoidamb, residual
-areg dailyvol_nonavoidamb if ambarrival==1, absorb(prov_dow_fe)
-predict exp_avoidamb, xbd
 predict unexp_avoidamb, residual
+areg dailyvol_nonavoidamb if ambarrival==1, absorb(prov_dow_fe)
+predict exp_nonavoidamb, xbd
+predict unexp_nonavoidamb, residual
+corr unexp_nonavoidamb unexp_avoidamb
 
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoidamb dailyvol_nonavoidamb ${x1} if ambarrival==1, absorb(prov_dow_fe)
 qui: sum unexp_avoidamb if e(sample)
 gen est_dailyvol_avoidamb=unexp_avoidamb/`r(sd)' if e(sample)
@@ -238,27 +288,15 @@ gen est_dailyvol_nonavoidamb=unexp_nonavoidamb/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoidamb est_dailyvol_nonavoidamb ${x1} if ambarrival==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoidamb est_dailyvol_nonavoidamb
 eststo `y'_ambdef
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_ambdef", replace
-}
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoidamb dailyvol_nonavoidamb ${x1} if ambarrival==1, absorb(prov_dow_fe)
-qui: sum dailyvol_avoidamb if e(sample)
-gen est_dailyvol_avoidamb=dailyvol_avoidamb/`r(sd)' if e(sample)
-qui: sum dailyvol_nonavoidamb if e(sample)
-gen est_dailyvol_nonavoidamb=dailyvol_nonavoidamb/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoidamb est_dailyvol_nonavoidamb ${x1} if ambarrival==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-margins, dydx(est_dailyvol_avoidamb est_dailyvol_nonavoidamb) post
-drop est_dailyvol_avoidamb est_dailyvol_nonavoidamb
-estimates save "output/robustness/`y'_poisson_ambdef", replace
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Supply side 2: Heterogeneity across hospital sizes
-// Explore heterogeneity across hospitals of different size by dividing the
-// the sample into 3 groups based on total volume of ED attendances
+// Explore heterogeneity across hospitals of different size by dividing 
+// the sample into 3 groups based on total attendances
 ////////////////////////////////////////////////////////////////////////////////
 
 xtile size=dailyvol_total, nq(3)
@@ -266,9 +304,9 @@ forvalues i=1/3 {
 
 preserve
 keep if size==`i'
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -276,32 +314,16 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
+eststo `y'_size
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_size`i'", replace
 }
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
-estimates save "output/robustness/`y'_size`i'", replace
-}
-
 restore	
-	
 }
        
 ////////////////////////////////////////////////////////////////////////////////
 // Supply side 3: Heterogeneity between times of day (in-hours/out-of-hours)
-// May reveal different input resource constraints (more stringent out-of-hours)
 ////////////////////////////////////////////////////////////////////////////////       
 
 // Define out of hours
@@ -314,9 +336,9 @@ replace ooh=. if weekend==.|night==.
 *** Out-of-hours ***
 preserve
 keep if ooh==1
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -324,22 +346,9 @@ sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_ooh", replace
-}
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_ooh
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_ooh", replace
 }
 restore	
@@ -348,9 +357,9 @@ restore
 *** In-hours ***
 preserve
 keep if ooh==0
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -359,38 +368,21 @@ gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
 eststo `y'_linear
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_ih", replace
 }
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
-estimates save "output/robustness/`y'_ih", replace
-}
-restore	
 
 ////////////////////////////////////////////////////////////////////////////////
 // Supply side 4: Heterogeneity across quintiles of hospital bed occupation
-// May reveal broader hospital capacity constraints limiting proba of admission
 ////////////////////////////////////////////////////////////////////////////////
 
 forvalues i=1/5 {
-
 preserve
 keep if bedocc_yday_q==`i'
-
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -398,31 +390,61 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
+eststo `y'_bed`i'
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_bed`i'", replace
 }
+restore	
+}
 
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
+////////////////////////////////////////////////////////////////////////////////
+// Supply side 5: Role of measurement error during high pressure periods
+// (i) Check if misclassified primary ED diagnosis, or having any treatment/invest.
+// Is correlated with unexpected demand from avoidable and non-avoidable patients
+// (ii) Check if proba of meeting criteria for NHS definition vary across unexp. demand
+////////////////////////////////////////////////////////////////////////////////
+
+// (i) Missclassifed and unexpected demand
+
+gen misclass=.
+replace misclass=0 if prim_diag!=.
+replace misclass=1 if prim_diag==40
+
+gen any_treat=.
+replace any_treat=1 if ntrt1>0&ntrt1!=.
+replace any_treat=0 if ntrt1==0
+
+gen any_inv=.
+replace any_inv=1 if ninv1>0&ninv1!=.
+replace any_inv=0 if ninv1==0
+
+global measurement misclass any_treat any_inv
+
+foreach y in $measurement {
+qui: areg `y' dailyvol_avoid dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
 qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
+reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-estimates save "output/robustness/`y'_bed`i'", replace
+eststo `y'_error
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_error", replace
 }
 
-restore	
-	
-}
+// (ii) Criteria for avoidable and unexpected demand
+eststo clear
+bysort unexp_avoid_na_q: eststo: quietly estpost summarize nhs_avoidable nhstreat nhsinvest nhsdisch nhsarrmode
+esttab using "output/robustness/qvolume_avoid.rtf", cells("mean(fmt(3)) sd(fmt(3))") title("Quintile unexp avoidable") replace
+eststo clear
+bysort unexp_dailyvol_tot: eststo: quietly estpost summarize nhs_avoidable nhstreat nhsinvest nhsdisch nhsarrmode
+esttab using "output/robustness/qvolume_total.rtf", cells("mean sd") title("Quintile unexp total") replace
 
 ////////////////////////////////////////////////////////////////////////////////
-// Supply side 5: Exclude central London where ambulances may decide where to go
+// Supply side 6: Exclude central London where ambulances may decide where to go
 ////////////////////////////////////////////////////////////////////////////////
 
 // Flag London CCGs
@@ -432,13 +454,13 @@ replace london=1 if inlist(ccg_treatment, "07V","07W","07X","08A","08C","08D","0
 replace london=1 if inlist(ccg_treatment, "08G","07Y","08H","08J","08K","08L","08R","08M")
 replace london=1 if inlist(ccg_treatment, "08N","08P","08Q","08T","08V","08W","08X","08Y")
 
-// Estimating Linear/Poisson models with HDFEs and scaling attendances volumes
-// by the SD of unexpected volumes, and excluding EDs in London
+// Run analysis excluding London
 preserve
 drop if london==1
-** Linear HDFE model for binary outcomes
+
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -446,24 +468,58 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_nolondon", replace
-}
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_london
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_nolondon", replace
 }
 restore   
+
+////////////////////////////////////////////////////////////////////////////////
+// Supply side 7: Analysis exploiting hourly variation
+////////////////////////////////////////////////////////////////////////////////
+
+// Generate FE for ED, hour-of-the-week and month
+egen how=group(hour dow)
+egen hourlyfe=group(prov_id how month) 
+egen clusterhour=group(prov_id how)
+egen hod=group(attdate hour)
+
+** Linear HDFE model
+eststo clear
+foreach y in $bin_out $after_out $cont_out {
+qui: areg `y' hourvol_avoid hourvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(hourlyfe)
+qui: sum hourvol_avoid if e(sample)
+scalar m1=r(sd)
+gen est_hourvol_avoid=hourvol_avoid/`r(sd)' if e(sample)
+qui: sum hourvol_nonavoid if e(sample)
+scalar m2=r(sd)
+gen est_hourvol_nonavoid=hourvol_nonavoid/`r(sd)' if e(sample)
+areg `y' est_hourvol_avoid est_hourvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(hourlyfe) vce(cluster prov_id)
+drop est_*
+eststo `y'_hourly
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_hourly", replace
+display m1
+display m2
+}
+
+// Test differences between avoidable and non-avoidable on volume scale (not SD scale)
+eststo clear
+foreach y in $bin_out $after_out $cont_out {
+qui: areg `y' hourvol_avoid hourvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(hourlyfe)
+qui: sum hourvol_avoid if e(sample)
+scalar sd1=`r(sd)' 
+qui: sum hourvol_nonavoid if e(sample)
+scalar sd2=`r(sd)'
+display `"`y'"', `"`:var label `y''"', `"`:val label `y''"'
+estimates use "output/robustness/`y'_hourly.ster"
+eststo `y': test sd1*est_hourvol_avoid=sd2*est_hourvol_nonavoid
+estadd scalar wald=`r(p)'
+}
+esttab $bin_out $after_out $cont_out using "output/robustness/wald_hour.rtf", keep(*cons*) scalar(wald) p(%9.4f) label replace
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Demand side 1: Heterogeneity across age groups
@@ -481,9 +537,9 @@ forvalues i=1/6 {
 
 preserve
 keep if agegr==`i'
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -491,40 +547,29 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
+eststo `y'_age`i'
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_agegr`i'", replace
 }
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
-estimates save "output/robustness/`y'_agegr`i'", replace
-}
-
-restore	
-	
+restore		
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Demand side 2: Results across discharge destinations
 // Ruling out that effects on outcomes are influenced by discharge destination
 ////////////////////////////////////////////////////////////////////////////////            
+
+global bin_outstab tot4hr
     
+*** After-attendance outcomes by discharge group ***
+
 *(a) leaving without treatment
 preserve
 keep if lwt==1
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out {
+foreach y in $bin_outstab $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -532,21 +577,9 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_lwt", replace
-}
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_lwt
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_lwt", replace
 }
 restore	
@@ -554,9 +587,9 @@ restore
 *(b) discharged without follow-up
 preserve
 keep if disch_nof==1
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out {
+foreach y in $bin_outstab $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -564,22 +597,9 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_nof", replace
-}
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_nof
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_nof", replace
 }
 restore	
@@ -587,9 +607,9 @@ restore
 *(c) discharged with GP follow-up
 preserve
 keep if disch_gp==1
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out {
+foreach y in $bin_outstab $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -597,22 +617,9 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_gpfu", replace
-}
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_gpfu
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_gpfu", replace
 }
 restore	
@@ -620,9 +627,9 @@ restore
 *(d) referred to other provider
 preserve
 keep if refclin==1|refoth==1
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out {
+foreach y in $bin_outstab $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -630,35 +637,22 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_refprov", replace
-}
-
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_refprov
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_refprov", replace
 }
 restore	
        
-////////////////////////////////////////////////////////////////////////////////
-// Demand side 3: Coefficient stability to adding detailed severity controls 
+////////////////////////////////////////////////////////////////////////////////////////
+// Demand side 3: Checking coefficient stability to adding more detailed severity controls 
 // Goal: Check coefficient stability to inclusion of better risk-adjustment vars
 // on the sub-sample of patients admitted to inpatient care for which we have
 // more accurate ICD-10 codes
-////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////
        
 ////////////////////////////////////////////////////////////////////////////////
-// Set up primary diagnosis data for admitted patients
+// Merge in primary diagnosis for admitted patients
 ////////////////////////////////////////////////////////////////////////////////
 
 preserve
@@ -698,16 +692,21 @@ replace icd10="Unknown" if icd10==""
 egen recode_icd10=group(icd10)
 save admitted, replace
 restore
+*/
 
 preserve
 clear all
-use admitted, clear
+use admitted
+compress
 
-** WITHOUT ELIXHAUSERS COMORBIDITIES
+* Coefficient stability analysis on patients admitted to inpatient care *
+global bin_outstab tot4hr
 
-** Linear HDFE model for binary outcomes
+** WITHOUT ELIXHAUSERS COMORBIDITIES **
+
+** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out {
+foreach y in $bin_outalt $after_out  {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x2} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -715,29 +714,17 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x2} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_stab1", replace
-}
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x2} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x2} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_stab1
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_stab1", replace
 }
 
-** WITH ELIXHAUSERS COMORBIDITIES
+** WITH ELIXHAUSERS COMORBIDITIES **
 
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out {
+foreach y in $cont_out $bin_outstab $after_out  {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -745,29 +732,17 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_stab2", replace
-}
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_stab2
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_stab2", replace
 }
      
-** WITH ELIXHAUSERS COMORBIDITIES AND INPATIENT ICD10 CODE
+** WITH ELIXHAUSERS COMORBIDITIES AND INPATIENT ICD10 CODE**
 
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out {
+foreach y in $cont_out $bin_outstab $after_out  {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} i.recode_icd10 if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -775,21 +750,9 @@ qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe recode_icd10) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_linear
-estimates save "output/robustness/`y'_stab3", replace
-}
-** Poisson HDFE model for continous outcomes
-eststo clear
-foreach y in $cont_out {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} i.recode_icd10 if nhs_nonavoidable==1, absorb(prov_dow_fe)
-qui: sum unexp_avoid_na if e(sample)
-gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
-qui: sum unexp_nonavoid_na if e(sample)
-gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe recode_icd10) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_stab3
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_stab3", replace
 }
 restore
@@ -798,11 +761,9 @@ restore
 // Specification check: Run main models including ineraction term
 ////////////////////////////////////////////////////////////////////////////////
 
-// Estimating Linear/Poisson models with HDFEs scaling attendance volumes by  SD
-
-** Linear HDFE model for binary outcomes
+** Linear HDFE model
 eststo clear
-foreach y in $bin_out $after_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -811,21 +772,69 @@ gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
 gen vol_inter=est_dailyvol_nonavoid*est_dailyvol_avoid
 reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid vol_inter ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid vol_inter
-eststo `y'_linear
-estimates save "output/interacted/`y'_allhdfe", replace
+eststo `y'_interacted
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_interacted", replace
 }
-** Poisson HDFE model for continous outcomes
+
+////////////////////////////////////////////////////////////////////////////////////////
+// CHECK STABILITY IN YEAR 2017/2018
+////////////////////////////////////////////////////////////////////////////////////////
+clear all
+*do prepare_altyear // Uncomment to run prepare_altyear.do saved in the same folder, which prepares the dataset from raw NHS data files
+use "finaldata_altyear", clear
+keep if nhs_nonavoidable==1
+compress 
+
+////////////////////////////////////////////////////////////////////////////////
+*********************************** ANALYSIS ***********************************
+////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////
+// CREATE GLOBALS
+////////////////////////////////////////////////////////////////////////////////
+
+// Covariates
+
+// Pooling elixhauser comorbidities together
+global elixyear nchf2yr narrhy2yr nvd2yr npcd2yr npvd2yr nhptn_uc2yr nhptn_c2yr npara2yr nothnd2yr ncopd2yr ndiab_uc2yr ndiab_c2yr nhypothy2yr nrf2yr nld2yr npud_nb2yr nhiv2yr nlymp2yr nmets2yr ntumor2yr nrheum_a2yr ncoag2yr nobesity2yr nwl2yr nfluid2yr nbla2yr nda2yr nalcohol2yr ndrug2yr npsycho2yr ndep2yr
+
+// Full set of covariates
+global x1 i.agesex ib0.eth i.imd2015_cat ib41.prim_diag ib0.nattsyr ib0.nemadyr ${elixyear} ib0.nelixyr ib2.arrmode i.attcat ib80.patgrp ib1.refsource ib10.incloc ib1.bedocc_yday_q
+
+// Outcomes 
+global cont_out ninv1 ntrt1 totdur initdur durinvtret
+global bin_out tot4hr admit lwt disch_nof disch_gp refclin refoth 
+global after_out reatt7_all dead30_ons 
+
+// Estimating Linear/Poisson models with HDFEs and transforming both attendances
 eststo clear
-foreach y in $cont_out {
+foreach y in $bin_out $after_out $cont_out {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
 qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-gen vol_inter=est_dailyvol_nonavoid*est_dailyvol_avoid
-ppmlhdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid vol_inter ${x1} if nhs_nonavoidable==1, d absorb(prov_dow_fe) vce(cluster prov_id)
-eststo `y'_poisson_nonavoid
-margins, dydx(est_dailyvol_avoid est_dailyvol_nonavoid vol_inter) post
-drop est_dailyvol_avoid est_dailyvol_nonavoid vol_inter
-estimates save "output/interacted/`y'_poisson_allhdfe", replace
+areg `y' est_dailyvol_avoid est_dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
+drop est_dailyvol_avoid est_dailyvol_nonavoid
+eststo `y'_altyear
+sum `y' if e(sample)
+estadd scalar mean = `r(mean)'
+estimates save "output/robustness/`y'_altyear", replace
 }
+
+// Test differences between avoidable and non-avoidable on volume scale (not SD scale)
+eststo clear
+foreach y in $bin_out $after_out $cont_out {
+qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
+qui: sum unexp_avoid_na if e(sample)
+scalar sd1=`r(sd)' 
+qui: sum unexp_nonavoid_na if e(sample)
+scalar sd2=`r(sd)'
+display `"`y'"', `"`:var label `y''"', `"`:val label `y''"'
+estimates use "output/robustness/`y'_altyear.ster"
+eststo `y': test sd1*est_dailyvol_avoid=sd2*est_dailyvol_nonavoid
+estadd scalar wald=`r(p)'
+}
+esttab $bin_out $after_out $cont_out using "output/robustness/wald_altyear.rtf", keep(*cons*) scalar(wald) p(%9.4f) label replace
