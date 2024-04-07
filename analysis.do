@@ -17,6 +17,7 @@ if c(username)=="Add your username" {
 
 cd "$path"
 *do preliminary // Uncomment to run preliminary.do saved in the same folder, which prepares the dataset from raw NHS data files
+*do avoidable // Uncomment to run avoidable.do saved in the same folder
 use finaldata, clear // The data that support the findings of this study are restricted and only available upon request from NHS Digital
 
 ////////////////////////////////////////////////////////////////////////////////
