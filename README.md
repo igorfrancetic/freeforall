@@ -25,7 +25,7 @@ The package includes a folder structure wiht 4 do-files. The main do-file to ope
 
 3 - Run the regression models described in the paper
 
-4 - Call the do-file "fdr_sharpened_qvalues.do" to obtain inference corrected for MHT. Note: the code is adapted directly from Anderson (2008), to which goes all credit. See here https://are.berkeley.edu/~mlanderson/ARE_Website/Research.html.
+4 - Call the do-file "fdr_sharpened_qvalues.do" to obtain inference corrected for MHT. Note: the code is adapted directly from Anderson (2008), to whom goes all credit. See here https://are.berkeley.edu/~mlanderson/ARE_Website/Research.html.
 
 5 - Call the do-file "outputs.do" to generates the tables and figures used in the paper
 
