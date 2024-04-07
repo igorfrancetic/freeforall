@@ -17,12 +17,18 @@ if c(username)=="Add your username" {
 
 cd "$path"
 *do preliminary // Uncomment to run preliminary.do saved in the same folder, which prepares the dataset from raw NHS data files
-*do avoidable // Uncomment to run avoidable.do saved in the same folder
+*do avoidable // Uncomment to run avoidable.do saved in the same folder, which identifies avoidable attendances and computes daily volumes thereof
 use finaldata, clear // The data that support the findings of this study are restricted and only available upon request from NHS Digital
+compress
 
 ////////////////////////////////////////////////////////////////////////////////
 *********************************** ANALYSIS ***********************************
 ////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////
+// DEFINING FIXED EFFECT -> ED, day of week, month of year seasonality
+////////////////////////////////////////////////////////////////////////////////
+egen prov_dow_fe=group(prov_id dow month)
 
 ////////////////////////////////////////////////////////////////////////////////
 // CREATE GLOBALS
@@ -43,9 +49,6 @@ global x2 i.agesex ib0.eth i.imd2015_cat ib41.prim_diag ib0.nattsyr ib0.nemadyr 
 global bin_out tot4hr admit lwt disch_nof disch_gp refclin refoth 
 global after_out reatt7_all dead30_ons 
 global cont_out aecost ninv1 ntrt1 totdur initdur durinvtret
-egen day=group(attdate)
-
-compress
 
 ////////////////////////////////////////////////////////////////////////////////
 // MAIN ESTIMATES (Table 3)
@@ -160,7 +163,6 @@ estadd scalar wald_`i'=`r(p)'
 }
 esttab totdur_10 initdur_10 durinvtret_10 tot4hr_10 aecost_10 ninv1_10 ntrt1_10 admit_10 lwt_10 disch_nof_10 disch_gp_10 refclin_10 refoth_10 reatt7_all_10 dead30_ons_10 using "output/main/decwald.rtf", keep(*cons*) scalar(wald_1 wald_2 wald_3 wald_4 wald_6 wald_7 wald_8 wald_9 wald_10) p(%9.4f) label replace
 
-
 ////////////////////////////////////////////////////////////////////////////////
 // ROBUSTNESS CHECKS
 ////////////////////////////////////////////////////////////////////////////////
@@ -237,16 +239,6 @@ drop est_dailyvol_avoid est_dailyvol_nonavoid
 // Transforming attendance volume to the SD scale
 ////////////////////////////////////////////////////////////////////////////////
 
-bysort prov_id attdate: egen dailyvol_tamav=total(tammes_avoidable)
-bysort prov_id attdate: egen dailyvol_tamnon=total(tammes_nonavoidable)
-areg dailyvol_tamav if tammes_avoidable==0, absorb(prov_dow_fe)
-predict exp_tamav, xbd
-predict unexp_tamav, residual
-areg dailyvol_tamnon if tammes_avoidable==0, absorb(prov_dow_fe)
-predict exp_tamnon, xbd
-predict unexp_tamnon, residual
-corr unexp_tamav unexp_tamnon
-
 // Linear HDFE model
 eststo clear
 foreach y in $bin_out $after_out $cont_out {
@@ -267,16 +259,6 @@ estimates save "output/robustness/`y'_tammes", replace
 // Ambulance arrival as definition of non-avoidable instead of NHS
 // Transforming attendance volume to the SD scale
 ////////////////////////////////////////////////////////////////////////////////
-
-bysort prov_id attdate: egen dailyvol_nonavoidamb=total(ambarrival)
-gen dailyvol_avoidamb=dailyvol_total-dailyvol_nonavoidamb
-areg dailyvol_avoidamb if ambarrival==1, absorb(prov_dow_fe)
-predict exp_avoidamb, xbd
-predict unexp_avoidamb, residual
-areg dailyvol_nonavoidamb if ambarrival==1, absorb(prov_dow_fe)
-predict exp_nonavoidamb, xbd
-predict unexp_nonavoidamb, residual
-corr unexp_nonavoidamb unexp_avoidamb
 
 ** Linear HDFE model
 eststo clear
@@ -373,6 +355,7 @@ sum `y' if e(sample)
 estadd scalar mean = `r(mean)'
 estimates save "output/robustness/`y'_ih", replace
 }
+restore
 
 ////////////////////////////////////////////////////////////////////////////////
 // Supply side 4: Heterogeneity across quintiles of hospital bed occupation
@@ -406,35 +389,23 @@ restore
 // (ii) Check if proba of meeting criteria for NHS definition vary across unexp. demand
 ////////////////////////////////////////////////////////////////////////////////
 
-// (i) Missclassifed and unexpected demand
+// (i) Missclassifed diagnosis and unexpected demand
 
 gen misclass=.
 replace misclass=0 if prim_diag!=.
 replace misclass=1 if prim_diag==40
 
-gen any_treat=.
-replace any_treat=1 if ntrt1>0&ntrt1!=.
-replace any_treat=0 if ntrt1==0
-
-gen any_inv=.
-replace any_inv=1 if ninv1>0&ninv1!=.
-replace any_inv=0 if ninv1==0
-
-global measurement misclass any_treat any_inv
-
-foreach y in $measurement {
-qui: areg `y' dailyvol_avoid dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe)
+qui: areg misclass dailyvol_avoid dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
 qui: sum unexp_nonavoid_na if e(sample)
 gen est_dailyvol_nonavoid=dailyvol_nonavoid/`r(sd)' if e(sample)
-reghdfe `y' est_dailyvol_avoid est_dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
+reghdfe misclass est_dailyvol_avoid est_dailyvol_nonavoid if nhs_nonavoidable==1, absorb(prov_dow_fe) vce(cluster prov_id)
 drop est_dailyvol_avoid est_dailyvol_nonavoid
-eststo `y'_error
-sum `y' if e(sample)
+eststo misclass_error
+sum misclass if e(sample)
 estadd scalar mean = `r(mean)'
-estimates save "output/robustness/`y'_error", replace
-}
+estimates save "output/robustness/misclass_error", replace
 
 // (ii) Criteria for avoidable and unexpected demand
 eststo clear
@@ -481,10 +452,7 @@ restore
 ////////////////////////////////////////////////////////////////////////////////
 
 // Generate FE for ED, hour-of-the-week and month
-egen how=group(hour dow)
 egen hourlyfe=group(prov_id how month) 
-egen clusterhour=group(prov_id how)
-egen hod=group(attdate hour)
 
 ** Linear HDFE model
 eststo clear
@@ -561,8 +529,6 @@ restore
 // Ruling out that effects on outcomes are influenced by discharge destination
 ////////////////////////////////////////////////////////////////////////////////            
 
-global bin_outstab tot4hr
-    
 *** After-attendance outcomes by discharge group ***
 
 *(a) leaving without treatment
@@ -570,7 +536,7 @@ preserve
 keep if lwt==1
 ** Linear HDFE model
 eststo clear
-foreach y in $bin_outstab $after_out $cont_out {
+foreach y in $cont_out $after_out tot4hr {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -590,7 +556,7 @@ preserve
 keep if disch_nof==1
 ** Linear HDFE model
 eststo clear
-foreach y in $bin_outstab $after_out $cont_out {
+foreach y in $cont_out $after_out tot4hr {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -610,7 +576,7 @@ preserve
 keep if disch_gp==1
 ** Linear HDFE model
 eststo clear
-foreach y in $bin_outstab $after_out $cont_out {
+foreach y in $cont_out $after_out tot4hr {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -630,7 +596,7 @@ preserve
 keep if refclin==1|refoth==1
 ** Linear HDFE model
 eststo clear
-foreach y in $bin_outstab $after_out $cont_out {
+foreach y in $cont_out $after_out tot4hr {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -648,8 +614,7 @@ restore
 ////////////////////////////////////////////////////////////////////////////////////////
 // Demand side 3: Checking coefficient stability to adding more detailed severity controls 
 // Goal: Check coefficient stability to inclusion of better risk-adjustment vars
-// on the sub-sample of patients admitted to inpatient care for which we have
-// more accurate ICD-10 codes
+// on the sub-sample of patients admitted to inpatient care for which we havee more accurate ICD-10 codes
 ////////////////////////////////////////////////////////////////////////////////////////
        
 ////////////////////////////////////////////////////////////////////////////////
@@ -658,7 +623,7 @@ restore
 
 preserve
 clear all
-use aekey admidate diag_01 using "$rawdatapath/apc2017.dta" // Opens inpatient data for 2017
+use aekey admidate diag_01 using "$rawdatapath/apc2017.dta" // Opens raw inpatient data for 2017
 keep if aekey!=.
 rename diag_01 inpat_primdiag
 rename admidate arrivaldate
@@ -668,7 +633,7 @@ keep if arrivaldate=="2017-04-01"
 save inpatdiag17, replace
 
 clear all
-use aekey admidate diag_01 admisorc using "$rawdatapath/apc2016.dta" // Opens inpatient data for 2016
+use aekey admidate diag_01 admisorc using "$rawdatapath/apc2016.dta" // Opens raw inpatient data for 2016
 keep if aekey!=.
 rename diag_01 inpat_primdiag
 rename admidate arrivaldate
@@ -693,21 +658,22 @@ replace icd10="Unknown" if icd10==""
 egen recode_icd10=group(icd10)
 save admitted, replace
 restore
-*/
+
+// Run regressions to check stability to inclusion of more refined 
+// individual confounders only on sub-sample of admitted patients
 
 preserve
 clear all
-use admitted
+use admitted 
 compress
 
 * Coefficient stability analysis on patients admitted to inpatient care *
-global bin_outstab tot4hr
 
 ** WITHOUT ELIXHAUSERS COMORBIDITIES **
 
 ** Linear HDFE model
 eststo clear
-foreach y in $bin_outalt $after_out  {
+foreach y in tot4hr $after_out  {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x2} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -725,7 +691,7 @@ estimates save "output/robustness/`y'_stab1", replace
 
 ** Linear HDFE model
 eststo clear
-foreach y in $cont_out $bin_outstab $after_out  {
+foreach y in $cont_out $after_out tot4hr {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -743,7 +709,7 @@ estimates save "output/robustness/`y'_stab2", replace
 
 ** Linear HDFE model
 eststo clear
-foreach y in $cont_out $bin_outstab $after_out  {
+foreach y in $cont_out $after_out tot4hr {
 qui: areg `y' dailyvol_avoid dailyvol_nonavoid ${x1} i.recode_icd10 if nhs_nonavoidable==1, absorb(prov_dow_fe)
 qui: sum unexp_avoid_na if e(sample)
 gen est_dailyvol_avoid=dailyvol_avoid/`r(sd)' if e(sample)
@@ -759,7 +725,8 @@ estimates save "output/robustness/`y'_stab3", replace
 restore
 
 ////////////////////////////////////////////////////////////////////////////////
-// Specification check: Run main models including ineraction term
+// Specification check: Run main models including itneraction term 
+// between volumes of avoidable and non-avoidable patients
 ////////////////////////////////////////////////////////////////////////////////
 
 ** Linear HDFE model
@@ -839,3 +806,8 @@ eststo `y': test sd1*est_dailyvol_avoid=sd2*est_dailyvol_nonavoid
 estadd scalar wald=`r(p)'
 }
 esttab $bin_out $after_out $cont_out using "output/robustness/wald_altyear.rtf", keep(*cons*) scalar(wald) p(%9.4f) label replace
+
+////////////////////////////////////////////////////////////////////////////////
+// GENERATE OUTPUT TABLES AND FIGURES FOR PAPER
+////////////////////////////////////////////////////////////////////////////////
+do outputs.do // This calls the do-file names "outputs.do", saved in the same folder
